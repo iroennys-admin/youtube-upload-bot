@@ -79,12 +79,19 @@ def _uid(message: Message) -> int | None:
 # ---------------------------------------------------------------------------
 
 def _yt_creds() -> Credentials | None:
-    if not all([YT_REFRESH_TOKEN, YT_CLIENT_ID, YT_CLIENT_SECRET]):
-        log.error("Faltan variables YOUTUBE_* en el entorno")
+    if not YT_CLIENT_ID or not YT_CLIENT_SECRET:
+        log.error("Faltan YOUTUBE_CLIENT_ID o YOUTUBE_CLIENT_SECRET")
         return None
+
+    # Intentar cargar desde env primero, después del archivo temporal
+    refresh = YT_REFRESH_TOKEN or _load_token_file()
+    if not refresh:
+        log.error("No hay YOUTUBE_REFRESH_TOKEN — usá /auth en Telegram")
+        return None
+
     return Credentials(
         token=None,
-        refresh_token=YT_REFRESH_TOKEN,
+        refresh_token=refresh,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=YT_CLIENT_ID,
         client_secret=YT_CLIENT_SECRET,
@@ -275,6 +282,10 @@ COMANDOS = """\
 • `/nuevo` — reinicia el proceso (si estás a medio camino)
 • `/skip` — salta la descripción del video
 • `/cancel` — cancela la operación actual
+• `/auth` — autenticar YouTube (genera link)
+• `/code` `<codigo>` — intercambia código por token
+• `/token` — muestra el refresh token actual
+• `/savetoken` — guarda el token en GitHub Secrets
 
 *¿Cómo funciona?*
 1. Mandame un video (o archivo de video)
@@ -288,11 +299,16 @@ COMANDOS = """\
 @bot.on_message(filters.command("start") & owner_filter)
 async def cmd_start(_c: Client, m: Message):
     """Bienvenida. Muestra intro y primer paso."""
+    if not _check_token():
+        auth_aviso = "\n\n⚠️ *YouTube no configurado* — usá `/auth` para conectar."
+    else:
+        auth_aviso = ""
     await m.reply(
         "🎬 *YouTube Uploader Bot*\n\n"
         "Mandame un video y lo subo a tu canal de YouTube.\n\n"
         "Usá `/help` para ver todos los comandos.\n\n"
-        "_También soporta Shorts_ 📱",
+        "_También soporta Shorts_ 📱"
+        + auth_aviso,
         parse_mode=enums.ParseMode.MARKDOWN,
     )
 
@@ -586,8 +602,164 @@ async def cmd_skip(_c: Client, m: Message):
 
 
 # ---------------------------------------------------------------------------
-# Flask — health check para Render
+# Autenticación de YouTube desde el bot
 # ---------------------------------------------------------------------------
+
+@bot.on_message(filters.command("auth") & owner_filter)
+async def cmd_auth(_c: Client, m: Message):
+    """Genera link para autenticar YouTube."""
+    if not YT_CLIENT_ID or not YT_CLIENT_SECRET:
+        await m.reply("❌ Faltan YOUTUBE_CLIENT_ID y YOUTUBE_CLIENT_SECRET.")
+        return
+    if _check_token():
+        await m.reply("✅ YouTube ya está autenticado. Usá /token para ver el refresh token.")
+        return
+
+    scope = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube"
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/auth"
+        f"?client_id={YT_CLIENT_ID}"
+        f"&redirect_uri=urn:ietf:wg:oauth:2.0:oob"
+        f"&scope={scope.replace(' ', '+')}"
+        f"&response_type=code"
+        f"&access_type=offline"
+        f"&prompt=consent"
+    )
+
+    await m.reply(
+        "🔑 *Autenticación de YouTube*\n\n"
+        "1. Abrí este link en tu navegador 👇\n"
+        f"{auth_url}\n\n"
+        "2. Iniciá sesión con tu cuenta de *YouTube*\n"
+        "3. Aceptá los permisos\n"
+        "4. Google te da un código (`4/0A...`)\n\n"
+        "5. Mandá `/code 4/0A...` acá en el chat",
+        parse_mode=enums.ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
+
+
+@bot.on_message(filters.command("code") & owner_filter)
+async def cmd_code(_c: Client, m: Message):
+    """Intercambia el código de autorización por un refresh token."""
+    import requests
+
+    code = m.text.replace("/code", "", 1).strip()
+    # Tambien capturar si viene separado
+    if not code:
+        # Puede venir como /code XXXX o como reply
+        if m.reply_to_message and m.reply_to_message.text:
+            code = m.reply_to_message.text.strip()
+    if not code or len(code) < 10:
+        await m.reply("❌ Usá: `/code 4/0A...` con el código que te dio Google")
+        return
+
+    status = await m.reply("⏳ Intercambiando código por tokens…")
+
+    try:
+        r = requests.post("https://oauth2.googleapis.com/token", data={
+            "client_id": YT_CLIENT_ID,
+            "client_secret": YT_CLIENT_SECRET,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+        }, timeout=30)
+        tokens = r.json()
+
+        if "refresh_token" not in tokens:
+            error = tokens.get("error_description", str(tokens))
+            await status.edit_text(f"❌ Error: `{error}`")
+            return
+
+        refresh_token = tokens["refresh_token"]
+
+        # Guardar para la sesión actual
+        _save_token(refresh_token)
+
+        await status.edit_text(
+            "✅ *YouTube autenticado!* 🎉\n\n"
+            "Ya podés subir videos *en esta sesión*.\n\n"
+            "Para las próximas ejecuciones, guardá este token:\n"
+            "`YOUTUBE_REFRESH_TOKEN=`" + refresh_token + "\n\n"
+            "Agregalo como secret en GitHub → Settings → Secrets → Actions\n"
+            "O decime y lo agrego yo con `/savetoken`",
+            parse_mode=enums.ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        await status.edit_text(f"❌ Error de conexión: {e}")
+
+
+@bot.on_message(filters.command("savetoken") & owner_filter)
+async def cmd_savetoken(_c: Client, m: Message):
+    """Guarda el refresh token como secret de GitHub (solo si hay GH_TOKEN)."""
+    token = _load_token_file()
+    if not token:
+        await m.reply("❌ No hay token guardado. Usá /auth primero.")
+        return
+
+    gh_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not gh_token:
+        await m.reply(
+            "❌ No se puede acceder a GitHub desde acá.\n"
+            "El token es:\n"
+            f"`YOUTUBE_REFRESH_TOKEN={token}`\n\n"
+            "Agregalo manualmente en:\n"
+            "https://github.com/iroennys-admin/youtube-upload-bot/settings/secrets/actions"
+        )
+        return
+
+    import subprocess
+    result = subprocess.run(
+        ["gh", "secret", "set", "YOUTUBE_REFRESH_TOKEN", "--body", token],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode == 0:
+        await m.reply("✅ Token guardado como secret de GitHub!")
+    else:
+        await m.reply(f"❌ Error: {result.stderr}")
+
+
+@bot.on_message(filters.command("token") & owner_filter)
+async def cmd_token(_c: Client, m: Message):
+    """Muestra el refresh token actual."""
+    token = YT_REFRESH_TOKEN or _load_token_file()
+    if token:
+        await m.reply(f"🔑 Refresh token actual:\n`{token}`")
+    else:
+        await m.reply("❌ No hay token. Usá /auth para autenticar.")
+
+
+def _check_token() -> bool:
+    """Verifica si hay refresh token disponible."""
+    global YT_REFRESH_TOKEN
+    if YT_REFRESH_TOKEN:
+        return True
+    tok = _load_token_file()
+    if tok:
+        YT_REFRESH_TOKEN = tok
+        return True
+    return False
+
+
+def _load_token_file() -> str | None:
+    """Lee refresh token del archivo temporal si existe."""
+    try:
+        with open("/tmp/yt_refresh_token.txt") as f:
+            tok = f.read().strip()
+            return tok if tok else None
+    except (FileNotFoundError, IOError):
+        return None
+
+
+def _save_token(token: str):
+    """Guarda refresh token en memoria y archivo temporal."""
+    global YT_REFRESH_TOKEN
+    YT_REFRESH_TOKEN = token
+    try:
+        with open("/tmp/yt_refresh_token.txt", "w") as f:
+            f.write(token)
+    except IOError:
+        pass
 
 flask_app = Flask(__name__)
 
